@@ -74,12 +74,18 @@ struct PdRoutes {
     sessions: parking_lot::Mutex<lru::LruCache<Vec<u8>, SessionPlacement>>,
 }
 
-/// Where a session's last turn was prefilled and its prompt size in bytes.
+/// Where a session's last turn ran and its prompt size in bytes.
 #[derive(Clone, Copy)]
 struct SessionPlacement {
     prefill: usize,
+    decode: usize,
     bytes: usize,
 }
+
+/// Open decode streams a session's last decode may carry above the least
+/// loaded decode before the session moves. Staying lets a decode radix cache
+/// reuse the session's history instead of receiving all of it again.
+const PD_DECODE_SLACK: usize = 4;
 
 /// Sessions whose placement the frontend remembers (least recently used first out).
 const PD_SESSIONS: usize = 65_536;
@@ -100,7 +106,13 @@ impl PdRoutes {
             .iter()
             .map(|p| p.outstanding.load(Ordering::Relaxed))
             .collect();
-        let (prefill, work) = match session {
+        let decode_loads: Vec<usize> = self
+            .decodes
+            .iter()
+            .map(|d| d.outstanding.load(Ordering::Relaxed))
+            .collect();
+        let least_loaded_decode = least_loaded(decode_loads.iter().copied(), start);
+        let (prefill, decode, work) = match session {
             Some(key) => {
                 let mut sessions = self.sessions.lock();
                 // A shorter prompt than last turn rewrote the history: no reuse.
@@ -146,15 +158,22 @@ impl PdRoutes {
                     Some(placed) if placed.prefill == choice => (bytes - placed.bytes).max(1),
                     _ => bytes,
                 };
-                sessions.put(key.to_vec(), SessionPlacement { prefill: choice, bytes });
-                (choice, work)
+                let floor = decode_loads[least_loaded_decode];
+                let decode = placed
+                    .map(|p| p.decode)
+                    .filter(|&d| {
+                        d < decode_loads.len()
+                            && decode_loads[d] <= floor.saturating_add(PD_DECODE_SLACK)
+                    })
+                    .unwrap_or(least_loaded_decode);
+                sessions.put(
+                    key.to_vec(),
+                    SessionPlacement { prefill: choice, decode, bytes },
+                );
+                (choice, decode, work)
             }
-            None => (least_loaded(loads.into_iter(), start), bytes),
+            None => (least_loaded(loads.into_iter(), start), least_loaded_decode, bytes),
         };
-        let decode = least_loaded(
-            self.decodes.iter().map(|d| d.outstanding.load(Ordering::Relaxed)),
-            start,
-        );
         (prefill, decode, work)
     }
 }
@@ -988,6 +1007,31 @@ mod tests {
         assert_eq!((next, work), (moved, 10_000));
         // A rewritten (shorter) history is not treated as cached.
         assert_eq!(pd.select(Some(&key), 50_000).2, 50_000);
+    }
+
+    #[test]
+    fn pd_sessions_keep_their_decode_until_it_is_overloaded() {
+        let engine = OpenAiHttpEngine::new_pd(
+            vec![PdPrefillOrigin { origin: "http://p0:1/".into(), bootstrap_port: 8998 }],
+            (0..4).map(|i| format!("http://d{i}:1/")).collect(),
+        )
+        .unwrap();
+        let pd = engine.pd.as_ref().unwrap();
+        let key = b"agent".to_vec();
+        let home = pd.select(Some(&key), 100).1;
+        // The session's decode stays while within the slack of the least loaded.
+        let _held = LoadHold::new(&pd.decodes[home].outstanding, PD_DECODE_SLACK);
+        for n in 1..4 {
+            assert_eq!(pd.select(Some(&key), 100 + n).1, home);
+        }
+        // Beyond the slack it moves, and then stays on the new decode.
+        let _busy = LoadHold::new(&pd.decodes[home].outstanding, 1);
+        let moved = pd.select(Some(&key), 200).1;
+        assert_ne!(moved, home);
+        assert_eq!(pd.select(Some(&key), 210).1, moved);
+        // Requests without a session still go to the least loaded decode.
+        let picks: BTreeSet<_> = (0..8).map(|_| pd.select(None, 1).1).collect();
+        assert!(!picks.contains(&home));
     }
 
     #[test]
